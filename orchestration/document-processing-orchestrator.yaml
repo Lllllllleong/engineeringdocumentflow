@@ -1,154 +1,144 @@
----
 main:
   params:
     - args
   steps:
-    - init:
+    - initialize:
         assign:
-          - project_id: ${sys.get_env("GCP_PROJECT")}
+          - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
           - execution_id: ${sys.get_env("GOOGLE_CLOUD_WORKFLOW_EXECUTION_ID")}
+          - firestore_doc_path: ${"projects/" + project_id + "/databases/(default)/documents/documents/" + args.documentId}
           - config:
-              collection_name: documents
               split_pages_bucket: ${sys.get_env("SPLIT_PAGES_BUCKET")}
               urls:
-                translator: https_page_translator_url
-                aggregator: https_markdown_aggregator_url
-                cleaner: https_markdown_cleaner_url
-                splitter: https_section_splitter_url
-    - getDocumentFromFirestore:
+                translator: ${sys.get_env("TRANSLATOR_URL")}
+                aggregator: ${sys.get_env("AGGREGATOR_URL")}
+                cleaner: ${sys.get_env("CLEANER_URL")}
+                splitter: ${sys.get_env("SPLITTER_URL")}
+          - default_retry_policy:
+              predicate: ${http.default_retry_predicate}
+              max_retries: 5
+              backoff:
+                initial_delay: 2
+                multiplier: 2
+
+    - main_execution_block:
         try:
-          - callApi:
+          - read_firestore_document:
               call: googleapis.firestore.v1.projects.databases.documents.get
               args:
-                name: ${"projects/" + project_id + "/databases/(default)/documents/" +
-                  config.collection_name + "/" + args.documentId}
-              result: firestoreDoc
-        except:
-          as: e
-          steps: null
-    - logAndRaise:
-        raise: >
-          ${"Firestore document not found: " + args.documentId + ". Error: " +
-          e.message}
-    - validateDocumentState:
-        switch:
-          - condition: ${...}
-            return: >
-              ${"Duplicate trigger for document " + args.documentId + ". Status: " +
-              firestoreDoc.fields.status.stringValue}
-    - condition: >
-        ${map.get(firestoreDoc.fields, "status",
-        {"stringValue":""}).stringValue == "WORKFLOW_STARTED" ||
-        map.get(firestoreDoc.fields, "status", {"stringValue":""}).stringValue
-        == "COMPLETE"}
-      return: >
-        ${"Duplicate trigger for document " + args.documentId + ". Status: " +
-        firestoreDoc.fields.status.stringValue}
-    - executeProcessingPipeline:
-        try:
-          - callProcessDocumentSubworkflow:
-              call: processDocument
+                name: ${firestore_doc_path}
+              result: firestore_doc
+              retry: ${default_retry_policy}
+
+          - idempotency_check:
+              switch:
+                - condition: ${firestore_doc.fields.status.stringValue == "WORKFLOW_STARTED" or firestore_doc.fields.status.stringValue == "COMPLETE"}
+                  return: ${"Duplicate trigger for document " + args.documentId + ". Status is " + firestore_doc.fields.status.stringValue}
+
+          - claim_job:
+              call: googleapis.firestore.v1.projects.databases.documents.patch
               args:
-                firestoreDoc: ${firestoreDoc}
-                args: ${args}
-                config: ${config}
-                execution_id: ${execution_id}
-              result: processingResult
-          - finish:
-              return: ${processingResult}
+                name: ${firestore_doc.name}
+                updateMask:
+                  # FORMATTING: Converted from inline list
+                  fieldPaths:
+                    - status
+                    - workflowExecutionId
+                body:
+                  fields:
+                    status:
+                      stringValue: WORKFLOW_STARTED
+                    workflowExecutionId:
+                      stringValue: ${execution_id}
+              retry: ${default_retry_policy}
+
+          - translate_pages_in_parallel:
+              parallel:
+                max_concurrency: 10
+                for:
+                  value: page_number
+                  in: ${range(1, args.pageCount + 1)}
+                  steps:
+                    - call_page_translator:
+                        call: call_authenticated_function
+                        args:
+                          url: ${config.urls.translator}
+                          body:
+                            documentId: ${args.documentId}
+                            pageNumber: ${page_number}
+                            gcsUri: ${"gs://" + config.split_pages_bucket + "/" + args.documentId + "/" + text.format("%04d", page_number) + ".pdf"}
+                            executionId: ${execution_id}
+                          retry_policy: ${default_retry_policy}
+
+          - aggregate_markdown:
+              call: call_authenticated_function
+              args:
+                url: ${config.urls.aggregator}
+                body:
+                  documentId: ${args.documentId}
+                  executionId: ${execution_id}
+                retry_policy: ${default_retry_policy}
+              result: aggregate_result
+
+          - clean_markdown:
+              call: call_authenticated_function
+              args:
+                url: ${config.urls.cleaner}
+                body:
+                  documentId: ${args.documentId}
+                  masterGcsUri: ${aggregate_result.body.masterGcsUri}
+                  executionId: ${execution_id}
+                retry_policy: ${default_retry_policy}
+              result: clean_result
+
+          - split_sections:
+              call: call_authenticated_function
+              args:
+                url: ${config.urls.splitter}
+                body:
+                  documentId: ${args.documentId}
+                  cleanedGcsUri: ${clean_result.body.cleanedGcsUri}
+                  executionId: ${execution_id}
+                retry_policy: ${default_retry_policy}
+          
+          - finalize_job:
+              call: googleapis.firestore.v1.projects.databases.documents.patch
+              args:
+                name: ${firestore_doc.name}
+                updateMask:
+                  fieldPaths:
+                    - status
+                body:
+                  fields:
+                    status:
+                      stringValue: COMPLETE
+              retry: ${default_retry_policy}
+          
+          - return_success:
+              return: "Workflow completed successfully."
+
         except:
           as: e
           steps:
-            - callUpdateStatusOnErrorSubworkflow:
-                call: updateStatusOnError
+            - update_status_on_error:
+                call: update_status_on_error
                 args:
-                  firestoreDocName: ${firestoreDoc.name}
+                  firestoreDocName: ${firestore_doc_path}
                   error: ${e}
-            - finish_failed:
-                return: Workflow failed and status has been updated in Firestore.
-processDocument:
-  params:
-    - firestoreDoc
-    - args
-    - config
-    - execution_id
-  steps:
-    - claimJob:
-        call: googleapis.firestore.v1.projects.databases.documents.patch
-        args:
-          name: ${firestoreDoc.name}
-          updateMask:
-            fieldPaths:
-              - status
-              - workflowExecutionId
-          body:
-            fields:
-              status:
-                stringValue: WORKFLOW_STARTED
-              workflowExecutionId:
-                stringValue: ${execution_id}
-        retry: ${http.default_retry}
-    - translatePages:
-        parallel:
-          for:
-            value: i
-            in: ${range(1, args.pageCount + 1)}
-            steps:
-              - translatePage:
-                  call: callAuthenticatedFunction
-                  args:
-                    url: ${config.urls.translator}
-                    body:
-                      documentId: ${args.documentId}
-                      pageNumber: ${i}
-                      gcsUri: ${"gs://" + config.split_pages_bucket + "/" + args.documentId + "/" + i
-                        + ".pdf"}
-                      executionId: ${execution_id}
-    - aggregateMarkdown:
-        call: callAuthenticatedFunction
-        args:
-          url: ${config.urls.aggregator}
-          body:
-            documentId: ${args.documentId}
-            executionId: ${execution_id}
-        result: aggregationResult
-    - cleanMarkdown:
-        call: callAuthenticatedFunction
-        args:
-          url: ${config.urls.cleaner}
-          body:
-            documentId: ${args.documentId}
-            masterGcsUri: ${aggregationResult.body.masterGcsUri}
-            executionId: ${execution_id}
-        result: cleanerResult
-    - splitSections:
-        call: callAuthenticatedFunction
-        args:
-          url: ${config.urls.splitter}
-          body:
-            documentId: ${args.documentId}
-            cleanedGcsUri: ${cleanerResult.body.cleanedGcsUri}
-            executionId: ${execution_id}
-    - finalizeJob:
-        call: googleapis.firestore.v1.projects.databases.documents.patch
-        args:
-          name: ${firestoreDoc.name}
-          updateMask:
-            fieldPaths:
-              - status
-          body:
-            fields:
-              status:
-                stringValue: COMPLETE
-        retry: ${http.default_retry}
-    - returnSuccess:
-        return: ${"Workflow completed successfully for document " + args.documentId}
-callAuthenticatedFunction:
+            - fail_workflow:
+                raise: ${e}
+
+# =====================================================================================
+# SUB-WORKFLOWS & HELPERS
+# =====================================================================================
+
+call_authenticated_function:
   params:
     - url
     - body
+    - retry_policy
   steps:
-    - postRequest:
+    - post_request:
         call: http.post
         args:
           url: ${url}
@@ -156,22 +146,45 @@ callAuthenticatedFunction:
             type: OIDC
           body: ${body}
         result: response
-    - returnResponse:
-        return: ${response}
-updateStatusOnError:
+        retry: ${retry_policy}
+    - check_response_code:
+        switch:
+          - condition: ${response.code < 400}
+            return: ${response}
+    - raise_intelligent_error:
+        switch:
+          - condition: ${response.code >= 500}
+            raise:
+              type: "ServerError"
+              http_code: ${response.code}
+              message: "Downstream function returned a server error."
+              response_body: ${response.body}
+          - condition: ${response.code >= 400}
+            raise:
+              type: "ClientError"
+              http_code: ${response.code}
+              message: "Downstream function rejected the request as a client error."
+              response_body: ${response.body}
+
+update_status_on_error:
   params:
     - firestoreDocName
     - error
   steps:
-    - logError:
-        call: sys.log
-        args:
-          text: |
-            ${"Workflow failed. Error: " + json.encode_to_string(error)}
-          severity: ERROR
-    - tryToUpdateFirestore:
+    - generate_error_details:
+        assign:
+          - http_error_type: ${map.get(error, "type", "Unknown")}
+          - error_string: ""
+        switch:
+          - condition: ${http_error_type == "ServerError" or http_error_type == "ClientError"}
+            assign:
+              - error_string: ${"Step " + error.step + ". Type " + error.type + " (HTTP " + string(error.http_code) + "). Message " + error.message}
+          - condition: true
+            assign:
+              - error_string: ${"Step " + map.get(error, "step", "N/A") + ". Details " + json.encode_to_string(error)}
+    - try_to_update_firestore:
         try:
-          - patchFirestore:
+          - patch_firestore_on_error:
               call: googleapis.firestore.v1.projects.databases.documents.patch
               args:
                 name: ${firestoreDocName}
@@ -182,17 +195,15 @@ updateStatusOnError:
                 body:
                   fields:
                     status:
-                      stringValue: FAILED_IN_WORKFLOW
+                      stringValue: "FAILED_IN_WORKFLOW"
                     errorDetails:
-                      stringValue: >
-                        ${json.encode_to_string(error.message) + " at step " + error.step}
+                      stringValue: ${error_string}
+              retry: ${http.default_retry}
         except:
           as: updateError
           steps:
-            - logUpdateFailure:
+            - log_critical_failure:
                 call: sys.log
                 args:
-                  text: >
-                    ${"CRITICAL: Failed to update error status in Firestore. Update Error: " +
-                    json.encode_to_string(updateError)}
                   severity: CRITICAL
+                  text: ${"CRITICAL Could not update Firestore to FAILED status. Original Error " + json.encode_to_string(error) + ". Update Error " + json.encode_to_string(updateError)}

@@ -14,18 +14,21 @@ import (
 
 	"cloud.google.com/go/firestore"
 	"cloud.google.com/go/storage"
-	"cloud.google.com/go/workflows/executions/apiv1"
+	executions "cloud.google.com/go/workflows/executions/apiv1"
 	"cloud.google.com/go/workflows/executions/apiv1/executionspb"
+
 	// CORRECTED import path for shared models
+	"github.com/Lllllllleong/engineeringdocumentflow/internal/gcp"
 	"github.com/Lllllllleong/engineeringdocumentflow/internal/models"
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
+
 	// CORRECTED typo in errgroup import
 	"golang.org/x/sync/errgroup"
 )
 
 // RENAMED to be specific to the splitter service
-type SplitterConfig struct {
+type PDFSplitterConfig struct {
 	ProjectID        string
 	SplitPagesBucket string
 	CollectionName   string
@@ -34,11 +37,11 @@ type SplitterConfig struct {
 }
 
 // RENAMED to be specific to the splitter service
-type SplitterFunction struct {
+type PDFSplitterFunction struct {
 	storageClient    *storage.Client
 	firestoreClient  *firestore.Client
 	executionsClient *executions.Client
-	config           SplitterConfig // Uses the renamed config struct
+	config           PDFSplitterConfig // Uses the renamed config struct
 }
 
 // GCSEvent is the payload of a GCS event. This can stay here or be moved to models.
@@ -48,26 +51,26 @@ type GCSEvent struct {
 }
 
 // RENAMED constructor to be specific. Called by main.go.
-func NewSplitter(ctx context.Context) (*SplitterFunction, error) {
-	projectID := os.Getenv("GCP_PROJECT")
+func NewPDFSplitter(ctx context.Context) (*PDFSplitterFunction, error) {
+	projectID := gcp.GetEnv("PROJECT_ID", "") // Use the shared helper
 	if projectID == "" {
 		return nil, fmt.Errorf("GCP_PROJECT environment variable must be set")
 	}
 
-	config := SplitterConfig{
+	config := PDFSplitterConfig{
 		ProjectID:        projectID,
-		SplitPagesBucket: getEnv("SPLIT_PAGES_BUCKET", ""),
-		CollectionName:   getEnv("FIRESTORE_COLLECTION", "documents"),
-		WorkflowLocation: getEnv("WORKFLOW_LOCATION", "us-central1"),
-		WorkflowID:       getEnv("WORKFLOW_ID", "document-processing-orchestrator"),
+		SplitPagesBucket: gcp.GetEnv("SPLIT_PAGES_BUCKET", ""),
+		CollectionName:   gcp.GetEnv("FIRESTORE_COLLECTION", "documents"),
+		WorkflowLocation: gcp.GetEnv("WORKFLOW_LOCATION", "us-central1"),
+		WorkflowID:       gcp.GetEnv("WORKFLOW_ID", "document-processing-orchestrator"),
 	}
 	if config.SplitPagesBucket == "" {
-		return nil, fmt.Errorf("SPLIT_PAGES_BUCKET must be set")
+		return nil, fmt.Errorf("SPLIT_PAGES_BUCKET environment variable must be set")
 	}
 
-	firestoreClient, err := firestore.NewClient(ctx, config.ProjectID)
+	firestoreClient, err := gcp.NewFirestoreClient(ctx, config.ProjectID) // Use the centralized factory
 	if err != nil {
-		return nil, fmt.Errorf("failed to create Firestore client: %w", err)
+		return nil, fmt.Errorf("failed to create firestore client: %w", err)
 	}
 	storageClient, err := storage.NewClient(ctx)
 	if err != nil {
@@ -78,7 +81,7 @@ func NewSplitter(ctx context.Context) (*SplitterFunction, error) {
 		return nil, fmt.Errorf("failed to create Workflows Executions client: %w", err)
 	}
 
-	f := &SplitterFunction{
+	f := &PDFSplitterFunction{
 		firestoreClient:  firestoreClient,
 		storageClient:    storageClient,
 		executionsClient: executionsClient,
@@ -89,7 +92,7 @@ func NewSplitter(ctx context.Context) (*SplitterFunction, error) {
 }
 
 // Process contains the core business logic. It's called by the entry point in main.go.
-func (f *SplitterFunction) Process(ctx context.Context, e GCSEvent) error {
+func (f *PDFSplitterFunction) Process(ctx context.Context, e GCSEvent) error {
 	tempDir, err := os.MkdirTemp("", "pdf-splitter-*")
 	if err != nil {
 		return fmt.Errorf("failed to create temp dir: %w", err)
@@ -140,7 +143,7 @@ func (f *SplitterFunction) Process(ctx context.Context, e GCSEvent) error {
 // NOTE: All helper functions below this line were correct.
 // I have included them here for completeness. No changes were needed to them.
 
-func (f *SplitterFunction) isDuplicate(ctx context.Context, fileHash string) (bool, error) {
+func (f *PDFSplitterFunction) isDuplicate(ctx context.Context, fileHash string) (bool, error) {
 	docs, err := f.firestoreClient.Collection(f.config.CollectionName).Where("fileHash", "==", fileHash).Limit(1).Documents(ctx).GetAll()
 	if err != nil {
 		return false, fmt.Errorf("failed to query for duplicates: %w", err)
@@ -152,7 +155,7 @@ func (f *SplitterFunction) isDuplicate(ctx context.Context, fileHash string) (bo
 	return false, nil
 }
 
-func (f *SplitterFunction) createInitialDocument(ctx context.Context, fileHash, filename string) (*firestore.DocumentRef, error) {
+func (f *PDFSplitterFunction) createInitialDocument(ctx context.Context, fileHash, filename string) (*firestore.DocumentRef, error) {
 	newDoc := models.Document{ // Uses the shared model
 		FileHash:         fileHash,
 		OriginalFilename: filename,
@@ -166,7 +169,7 @@ func (f *SplitterFunction) createInitialDocument(ctx context.Context, fileHash, 
 	return docRef, nil
 }
 
-func (f *SplitterFunction) optimizeAndPrepare(ctx context.Context, docRef *firestore.DocumentRef, source, optimized string) (int, error) {
+func (f *PDFSplitterFunction) optimizeAndPrepare(ctx context.Context, docRef *firestore.DocumentRef, source, optimized string) (int, error) {
 	if err := optimizePDF(source, optimized); err != nil {
 		return 0, f.handleError(ctx, docRef, "failed to validate/optimize PDF", err)
 	}
@@ -187,14 +190,14 @@ func (f *SplitterFunction) optimizeAndPrepare(ctx context.Context, docRef *fires
 	return pageCount, nil
 }
 
-func (f *SplitterFunction) uploadSplitPages(ctx context.Context, docRef *firestore.DocumentRef, optimizedPdfPath string, pageCount int) error {
+func (f *PDFSplitterFunction) uploadSplitPages(ctx context.Context, docRef *firestore.DocumentRef, optimizedPdfPath string, pageCount int) error {
 	log.Printf("Starting CONCURRENT upload of %d pages...", pageCount)
 	eg, gctx := errgroup.WithContext(ctx)
 	splitFileBase := optimizedPdfPath[:len(filepath.Ext(optimizedPdfPath))]
 	for i := 1; i <= pageCount; i++ {
 		pageNumber := i
 		localSplitFilePath := fmt.Sprintf("%s_%d.pdf", splitFileBase, pageNumber)
-		gcsDestObject := fmt.Sprintf("%s/%d.pdf", docRef.ID, pageNumber)
+		gcsDestObject := fmt.Sprintf("%s/%05d.pdf", docRef.ID, pageNumber)
 		eg.Go(func() error {
 			if err := f.uploadFile(gctx, localSplitFilePath, gcsDestObject); err != nil {
 				return fmt.Errorf("page %d: failed to upload: %w", pageNumber, err)
@@ -209,7 +212,7 @@ func (f *SplitterFunction) uploadSplitPages(ctx context.Context, docRef *firesto
 	return nil
 }
 
-func (f *SplitterFunction) triggerWorkflow(ctx context.Context, docRef *firestore.DocumentRef, pageCount int) error {
+func (f *PDFSplitterFunction) triggerWorkflow(ctx context.Context, docRef *firestore.DocumentRef, pageCount int) error {
 	log.Printf("Triggering workflow '%s' for document ID %s", f.config.WorkflowID, docRef.ID)
 	workflowPayload := map[string]interface{}{
 		"documentId": docRef.ID,
@@ -232,7 +235,7 @@ func (f *SplitterFunction) triggerWorkflow(ctx context.Context, docRef *firestor
 	return nil
 }
 
-func (f *SplitterFunction) handleError(ctx context.Context, docRef *firestore.DocumentRef, message string, originalErr error) error {
+func (f *PDFSplitterFunction) handleError(ctx context.Context, docRef *firestore.DocumentRef, message string, originalErr error) error {
 	fullError := fmt.Sprintf("%s: %v", message, originalErr)
 	log.Printf("Error for doc %s: %s", docRef.ID, fullError)
 	if err := f.updateStatus(ctx, docRef, "FAILED", fullError); err != nil {
@@ -241,7 +244,7 @@ func (f *SplitterFunction) handleError(ctx context.Context, docRef *firestore.Do
 	return fmt.Errorf("%s", fullError)
 }
 
-func (f *SplitterFunction) updateStatus(ctx context.Context, docRef *firestore.DocumentRef, status, errDetails string) error {
+func (f *PDFSplitterFunction) updateStatus(ctx context.Context, docRef *firestore.DocumentRef, status, errDetails string) error {
 	updates := []firestore.Update{
 		{Path: "status", Value: status},
 	}
@@ -252,7 +255,7 @@ func (f *SplitterFunction) updateStatus(ctx context.Context, docRef *firestore.D
 	return err
 }
 
-func (f *SplitterFunction) streamGCSObject(ctx context.Context, bucket, object, destPath string) error {
+func (f *PDFSplitterFunction) streamGCSObject(ctx context.Context, bucket, object, destPath string) error {
 	gcsReader, err := f.storageClient.Bucket(bucket).Object(object).NewReader(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get GCS object reader for gs://%s/%s: %w", bucket, object, err)
@@ -275,7 +278,7 @@ func optimizePDF(inPath, outPath string) error {
 	return api.OptimizeFile(inPath, outPath, cfg)
 }
 
-func (f *SplitterFunction) uploadFile(ctx context.Context, localPath, destObject string) error {
+func (f *PDFSplitterFunction) uploadFile(ctx context.Context, localPath, destObject string) error {
 	localFileReader, err := os.Open(localPath)
 	if err != nil {
 		return fmt.Errorf("could not open local file %s: %w", localPath, err)
@@ -300,11 +303,4 @@ func calculateFileHash(filePath string) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil
-}
-
-func getEnv(key, fallback string) string {
-	if value, ok := os.LookupEnv(key); ok {
-		return value
-	}
-	return fallback
 }

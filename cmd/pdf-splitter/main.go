@@ -13,7 +13,7 @@ import (
 )
 
 var (
-	splitterInstance *services.SplitterFunction
+	pdfSplitterInstance *services.PDFSplitterFunction
 	once             sync.Once
 	initErr          error
 )
@@ -31,7 +31,7 @@ func main() {}
 func splitAndPublish(ctx context.Context, e cloudevents.Event) error {
 	// Use sync.Once for robust, one-time initialization of clients.
 	once.Do(func() {
-		splitterInstance, initErr = services.NewSplitter(context.Background())
+		pdfSplitterInstance, initErr = services.NewPDFSplitter(context.Background())
 	})
 	if initErr != nil {
 		log.Fatalf("Critical error during function initialization: %v", initErr)
@@ -48,7 +48,7 @@ func splitAndPublish(ctx context.Context, e cloudevents.Event) error {
 
 	// Now, delegate the actual processing to our clean business logic method,
 	// passing the correctly typed and populated struct.
-	err := splitterInstance.Process(ctx, gcsEvent)
+	err := pdfSplitterInstance.Process(ctx, gcsEvent)
 	if err != nil {
 		// The error is already logged within the Process method.
 		// Returning it marks the function invocation as failed.

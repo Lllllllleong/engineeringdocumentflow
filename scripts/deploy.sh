@@ -1,17 +1,12 @@
 #!/bin/bash
 # =============================================================================
-#           UNIFIED DEPLOY SCRIPT FOR THE DOCUMENT PROCESSING PIPELINE
+#           FINAL DEPLOY SCRIPT FOR THE DOCUMENT PROCESSING PIPELINE
 # =============================================================================
-# Deploys services for the orchestrated PDF processing pipeline.
+# Deploys services for the orchestrated PDF processing pipeline. Each service
+# is configured with only the environment variables it requires.
 #
 # USAGE:
 #   ./scripts/deploy.sh [SERVICE_NAME]
-#
-# EXAMPLES:
-#   ./scripts/deploy.sh pdf-splitter       # Deploys only the pdf-splitter function
-#   ./scripts/deploy.sh page-translator    # Deploys only the page-translator function
-#   ./scripts/deploy.sh workflow           # Deploys only the Cloud Workflow
-#   ./scripts/deploy.sh all                # Deploys all functions and the workflow
 #
 # PREREQUISITE:
 #   Run `source ./scripts/setup_env.sh` to load environment variables.
@@ -22,65 +17,23 @@ set -e
 
 # --- SCRIPT SETUP ---
 # Ensure environment variables are loaded
-if [ -z "$PROJECT_ID" ]; then
-    echo "ERROR: Environment variables not set. Please run 'source ./scripts/setup_env.sh' first."
+if [ -z "$PROJECT_ID" ] || [ -z "$REGION" ]; then
+    echo "ERROR: Core environment variables (PROJECT_ID, REGION) not set."
+    echo "Please run 'source ./scripts/setup_env.sh' first."
     exit 1
 fi
 
-# --- HELPER FUNCTIONS ---
-
-# Deploys a Go Cloud Function from the monorepo
-# $1: Function name (e.g., pdf-splitter)
-# $2: Trigger type ('gcs' or 'http')
-deploy_go_function() {
-    local FUNCTION_NAME=$1
-    local TRIGGER_TYPE=$2
-    local ENTRY_POINT="main" # All our HTTP functions will have a main entry point
-
-    echo ""
-    echo "------------------------------------------------------------"
-    echo "Deploying Go Function: ${FUNCTION_NAME}"
-    echo "------------------------------------------------------------"
-
-    # Set common deploy flags
-    local DEPLOY_FLAGS=(
-        "--gen2"
-        "--runtime=go1.22"
-        "--project=${PROJECT_ID}"
-        "--region=${REGION}"
-        "--source=." # CORRECT: Source is the repo root for Go modules
-        "--service-account=${SERVICE_ACCOUNT_EMAIL}"
-        "--timeout=540s"
-        "--memory=1Gi"
-        "--update-labels=app=pdf-pipeline,service=${FUNCTION_NAME}"
-        # This tells Cloud Build where to find the function's main package
-        "--set-build-env-vars=GOPACKAGE=github.com/Lllllllleong/engineeringdocumentflow/cmd/${FUNCTION_NAME}"
-    )
-
-    # Set trigger-specific flags
-    if [ "$TRIGGER_TYPE" == "gcs" ]; then
-        # This is for the first function in the pipeline
-        DEPLOY_FLAGS+=(
-            "--entry-point=SplitAndPublish"
-            "--trigger-resource=${UPLOADS_BUCKET}"
-            "--trigger-event=google.cloud.storage.object.v1.finalized"
-            "--set-env-vars=SPLIT_PAGES_BUCKET=${SPLIT_PAGES_BUCKET},FIRESTORE_COLLECTION=${FIRESTORE_COLLECTION},WORKFLOW_LOCATION=${WORKFLOW_LOCATION},WORKFLOW_ID=${WORKFLOW_ID}"
-        )
-    elif [ "$TRIGGER_TYPE" == "http" ]; {
-        # This is for all the "worker" functions called by the workflow
-        DEPLOY_FLAGS+=(
-            "--trigger-http"
-            "--no-allow-unauthenticated"
-            "--set-env-vars=MARKDOWN_BUCKET=${MARKDOWN_BUCKET},AGGREGATED_BUCKET=${AGGREGATED_BUCKET},CLEANED_BUCKET=${CLEANED_BUCKET},FINAL_SECTIONS_BUCKET=${FINAL_SECTIONS_BUCKET},VERTEX_AI_REGION=${VERTEX_AI_REGION},GEMINI_MODEL_NAME=${GEMINI_MODEL_NAME}"
-        )
-    }
-    else
-        echo "ERROR: Invalid trigger type '${TRIGGER_TYPE}' for ${FUNCTION_NAME}."
-        exit 1
-    fi
-
-    gcloud functions deploy "${FUNCTION_NAME}" "${DEPLOY_FLAGS[@]}"
-}
+# Common flags for all Go functions
+# FIX: The --source flag is now specific to each function, so it has been removed from here.
+COMMON_FLAGS=(
+    "--gen2"
+    "--runtime=go123"
+    "--project=${PROJECT_ID}"
+    "--region=${REGION}"
+    "--service-account=${SERVICE_ACCOUNT_EMAIL}"
+    "--timeout=540s"
+    "--memory=1Gi"
+)
 
 # Deploys the Cloud Workflow definition
 deploy_workflow() {
@@ -88,12 +41,12 @@ deploy_workflow() {
     echo "------------------------------------------------------------"
     echo "Deploying Cloud Workflow: document-processing-orchestrator"
     echo "------------------------------------------------------------"
-
     gcloud workflows deploy document-processing-orchestrator \
         --project="${PROJECT_ID}" \
         --location="${REGION}" \
         --source=./orchestration/document-processing-orchestrator.yaml \
-        --service-account="${SERVICE_ACCOUNT_EMAIL}"
+        --service-account="${SERVICE_ACCOUNT_EMAIL}" \
+        --set-env-vars="PROJECT_ID=${PROJECT_ID},SPLIT_PAGES_BUCKET=${SPLIT_PAGES_BUCKET},TRANSLATOR_URL=${TRANSLATOR_URL},AGGREGATOR_URL=${AGGREGATOR_URL},CLEANER_URL=${CLEANER_URL},SPLITTER_URL=${SPLITTER_URL}"
 }
 
 # --- MAIN LOGIC ---
@@ -105,40 +58,96 @@ if [ -z "$1" ]; then
     exit 1
 fi
 
-case "$1" in
+SERVICE_TO_DEPLOY=$1
+
+deploy_pdf_splitter() {
+    echo "--- Deploying pdf-splitter ---"
+    gcloud functions deploy "pdf-splitter" \
+        "${COMMON_FLAGS[@]}" \
+        --entry-point="SplitAndPublish" \
+        --source=./cmd/pdf-splitter \
+        --trigger-resource="${UPLOADS_BUCKET}" \
+        --trigger-event="google.cloud.storage.object.v1.finalized" \
+        --set-env-vars="GOOGLE_CLOUD_PROJECT_ID=${PROJECT_ID},SPLIT_PAGES_BUCKET=${SPLIT_PAGES_BUCKET},FIRESTORE_COLLECTION=${FIRESTORE_COLLECTION},WORKFLOW_LOCATION=${WORKFLOW_LOCATION},WORKFLOW_ID=${WORKFLOW_ID}"
+}
+
+deploy_page_translator() {
+    echo "--- Deploying page-translator ---"
+    gcloud functions deploy "page-translator" \
+        "${COMMON_FLAGS[@]}" \
+        --entry-point="HandleTranslatePage" \
+        --source=./cmd/page-translator \
+        --trigger-http \
+        --no-allow-unauthenticated \
+        --set-env-vars="GOOGLE_CLOUD_PROJECT_ID=${PROJECT_ID},VERTEX_AI_REGION=${VERTEX_AI_REGION},TRANSLATED_MARKDOWN_BUCKET=${TRANSLATED_MARKDOWN_BUCKET}"
+}
+
+deploy_markdown_aggregator() {
+    echo "--- Deploying markdown-aggregator ---"
+    gcloud functions deploy "markdown-aggregator" \
+        "${COMMON_FLAGS[@]}" \
+        --entry-point="HandleAggregateMarkdown" \
+        --source=./cmd/markdown-aggregator \
+        --trigger-http \
+        --no-allow-unauthenticated \
+        --set-env-vars="GOOGLE_CLOUD_PROJECT_ID=${PROJECT_ID},TRANSLATED_MARKDOWN_BUCKET=${TRANSLATED_MARKDOWN_BUCKET},AGGREGATED_MARKDOWN_BUCKET=${AGGREGATED_MARKDOWN_BUCKET}"
+}
+
+deploy_markdown_cleaner() {
+    echo "--- Deploying markdown-cleaner ---"
+    gcloud functions deploy "markdown-cleaner" \
+        "${COMMON_FLAGS[@]}" \
+        --entry-point="HandleCleanMarkdown" \
+        --source=./cmd/markdown-cleaner \
+        --trigger-http \
+        --no-allow-unauthenticated \
+        --set-env-vars="GOOGLE_CLOUD_PROJECT_ID=${PROJECT_ID},VERTEX_AI_REGION=${VERTEX_AI_REGION},CLEANED_MARKDOWN_BUCKET=${CLEANED_MARKDOWN_BUCKET}"
+}
+
+deploy_section_splitter() {
+    echo "--- Deploying section-splitter ---"
+    gcloud functions deploy "section-splitter" \
+        "${COMMON_FLAGS[@]}" \
+        --entry-point="HandleSplitSections" \
+        --source=./cmd/section-splitter \
+        --trigger-http \
+        --no-allow-unauthenticated \
+        --set-env-vars="GOOGLE_CLOUD_PROJECT_ID=${PROJECT_ID},VERTEX_AI_REGION=${VERTEX_AI_REGION},FINAL_SECTIONS_BUCKET=${FINAL_SECTIONS_BUCKET}"
+}
+
+case "$SERVICE_TO_DEPLOY" in
     pdf-splitter)
-        deploy_go_function "pdf-splitter" "gcs"
+        deploy_pdf_splitter
         ;;
     page-translator)
-        deploy_go_function "page-translator" "http"
+        deploy_page_translator
         ;;
     markdown-aggregator)
-        deploy_go_function "markdown-aggregator" "http"
+        deploy_markdown_aggregator
         ;;
     markdown-cleaner)
-        deploy_go_function "markdown-cleaner" "http"
+        deploy_markdown_cleaner
         ;;
     section-splitter)
-        deploy_go_function "section-splitter" "http"
+        deploy_section_splitter
         ;;
     workflow)
         deploy_workflow
         ;;
     all)
         echo "Deploying all services..."
-        deploy_go_function "pdf-splitter" "gcs"
-        deploy_go_function "page-translator" "http"
-        deploy_go_function "markdown-aggregator" "http"
-        deploy_go_function "markdown-cleaner" "http"
-        deploy_go_function "section-splitter" "http"
+        deploy_pdf_splitter
+        deploy_page_translator
+        deploy_markdown_aggregator
+        deploy_markdown_cleaner
+        deploy_section_splitter
         deploy_workflow
         ;;
     *)
-        echo "Error: Unknown service '$1'."
-        echo "Available services: pdf-splitter, page-translator, markdown-aggregator, markdown-cleaner, section-splitter, workflow, all"
+        echo "Error: Unknown service '$SERVICE_TO_DEPLOY'."
         exit 1
         ;;
 esac
 
 echo ""
-echo "✅ Deployment script finished for '$1'."
+echo "✅ Deployment script finished for '$SERVICE_TO_DEPLOY'."

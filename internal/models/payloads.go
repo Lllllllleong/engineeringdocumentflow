@@ -42,14 +42,14 @@ type MarkdownCleanerResponse struct {
 	CleanedGCSUri string `json:"cleanedGcsUri"`
 }
 
-// SectionSplitterRequest is the input for the section-splitter function.
+
 type SectionSplitterRequest struct {
 	DocumentID    string `json:"documentId"`
 	CleanedGCSUri string `json:"cleanedGcsUri"`
 	ExecutionID   string `json:"executionId"`
 }
 
-// SectionSplitterResponse is the output of the section-splitter function.
+
 type SectionSplitterResponse struct {
 	Status       string `json:"status"`
 	SectionCount int    `json:"sectionCount"`
