@@ -23,7 +23,7 @@ export SERVICE_ACCOUNT_EMAIL="pipeline-runner-sa@${PROJECT_ID}.iam.gserviceaccou
 
 # --- GCS Buckets (as per the revised plan) ---
 # Each variable corresponds to a bucket used by one or more services.
-export UPLOADS_BUCKET="${PROJECT_ID}-uploads"
+export UPLOADS_BUCKET="${PROJECT_ID}-ingest"
 export SPLIT_PAGES_BUCKET="${PROJECT_ID}-split-pages"
 export TRANSLATED_MARKDOWN_BUCKET="${PROJECT_ID}-translated-markdown"
 export AGGREGATED_MARKDOWN_BUCKET="${PROJECT_ID}-aggregated-markdown"
