@@ -3,7 +3,7 @@ package services
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 
 	"cloud.google.com/go/storage"
@@ -14,8 +14,8 @@ import (
 
 // CleanerConfig holds configuration for the markdown-cleaner service.
 type CleanerConfig struct {
-	ProjectID          string
-	VertexAIRegion     string
+	ProjectID             string
+	VertexAIRegion        string
 	CleanedMarkdownBucket string
 }
 
@@ -34,8 +34,8 @@ func NewCleaner(ctx context.Context) (*CleanerFunction, error) {
 	}
 
 	config := CleanerConfig{
-		ProjectID:          projectID,
-		VertexAIRegion:     gcp.GetEnv("VERTEX_AI_REGION", "us-central1"),
+		ProjectID:             projectID,
+		VertexAIRegion:        gcp.GetEnv("VERTEX_AI_REGION", "us-central1"),
 		CleanedMarkdownBucket: gcp.GetEnv("CLEANED_MARKDOWN_BUCKET", ""), // Destination bucket
 	}
 	if config.CleanedMarkdownBucket == "" {
@@ -62,21 +62,20 @@ func NewCleaner(ctx context.Context) (*CleanerFunction, error) {
 
 // Process handles the core logic of cleaning the aggregated Markdown file.
 func (f *CleanerFunction) Process(ctx context.Context, req *models.MarkdownCleanerRequest) (*models.MarkdownCleanerResponse, error) {
-	log.Printf("[Doc: %s][Exec: %s] Starting markdown cleanup.", req.DocumentID, req.ExecutionID)
+	logCtx := slog.With("documentId", req.DocumentID, "executionId", req.ExecutionID)
+	logCtx.Info("Starting markdown cleanup.")
 
 	// --- 1. Call the pre-configured cleaner model ---
-	// We pass the GCS URI directly, which is more efficient than reading the file into memory first.
-	// The model has a large context window and is specifically prompted for this task.
 	model := f.vertexClient.CleanerModel
-	prompt := genai.Text(gcp.CleanerUserPrompt) // The user prompt is defined centrally
+	prompt := genai.Text(gcp.CleanerUserPrompt)
 	filePart := genai.FileData{
-		MIMEType: "text/markdown", // Inform the model about the content type
+		MIMEType: "text/markdown",
 		FileURI:  req.MasterGCSUri,
 	}
 
 	geminiResp, err := model.GenerateContent(ctx, filePart, prompt)
 	if err != nil {
-		log.Printf("[Doc: %s][Exec: %s] ERROR calling Vertex AI for cleanup: %v", req.DocumentID, req.ExecutionID, err)
+		logCtx.Error("Call to Vertex AI for cleanup failed", "error", err)
 		return nil, fmt.Errorf("failed to generate cleaned content from gemini: %w", err)
 	}
 
@@ -94,13 +93,13 @@ func (f *CleanerFunction) Process(ctx context.Context, req *models.MarkdownClean
 	for _, phrase := range refusalPhrases {
 		if strings.Contains(lowerCleanedContent, phrase) {
 			err := fmt.Errorf("gemini response indicates refusal to clean document")
-			log.Printf("[Doc: %s][Exec: %s] ERROR: %v. Response: '%s'", req.DocumentID, req.ExecutionID, err, cleanedContent)
+			logCtx.Error("LLM refusal detected", "error", err, "response", cleanedContent)
 			return nil, err
 		}
 	}
 
 	if cleanedContent == "" {
-		log.Printf("[Doc: %s][Exec: %s] WARNING: No markdown content extracted from cleanup response. Saving empty file.", req.DocumentID, req.ExecutionID)
+		logCtx.Warn("No markdown content extracted from cleanup response. Saving empty file.")
 	}
 
 	// --- 3. Save the cleaned content to the destination bucket ---
@@ -108,13 +107,13 @@ func (f *CleanerFunction) Process(ctx context.Context, req *models.MarkdownClean
 	bucketHandle := f.storageClient.Bucket(f.config.CleanedMarkdownBucket)
 
 	if err := gcp.SaveToGCSAtomically(ctx, bucketHandle, objectName, cleanedContent); err != nil {
-		log.Printf("[Doc: %s][Exec: %s] ERROR: Failed to save cleaned markdown to GCS: %v", req.DocumentID, req.ExecutionID, err)
+		logCtx.Error("Failed to save cleaned markdown to GCS", "error", err, "bucket", f.config.CleanedMarkdownBucket, "object", objectName)
 		return nil, err
 	}
 
 	// --- 4. Return the success response with the new URI ---
 	outputGCSUri := fmt.Sprintf("gs://%s/%s", f.config.CleanedMarkdownBucket, objectName)
-	log.Printf("[Doc: %s][Exec: %s] Markdown cleanup complete. Saved to %s", req.DocumentID, req.ExecutionID, outputGCSUri)
+	logCtx.Info("Markdown cleanup complete.", "outputGcsUri", outputGCSUri)
 
 	return &models.MarkdownCleanerResponse{
 		Status:        "success",
@@ -123,7 +122,6 @@ func (f *CleanerFunction) Process(ctx context.Context, req *models.MarkdownClean
 }
 
 // extractCleanedMarkdown robustly parses the model's response to get the text content.
-// It's similar to the translator's extractor but tailored for this service.
 func (f *CleanerFunction) extractCleanedMarkdown(resp *genai.GenerateContentResponse) string {
 	if resp == nil || len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil || len(resp.Candidates[0].Content.Parts) == 0 {
 		return ""
@@ -136,8 +134,6 @@ func (f *CleanerFunction) extractCleanedMarkdown(resp *genai.GenerateContentResp
 		}
 	}
 
-	// The prompt instructs the model not to use markdown fences, but we clean them
-	// just in case it disobeys.
 	contentStr := strings.TrimSpace(contentBuilder.String())
 	contentStr = strings.TrimPrefix(contentStr, "```markdown")
 	contentStr = strings.TrimPrefix(contentStr, "```")

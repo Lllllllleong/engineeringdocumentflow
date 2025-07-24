@@ -1,209 +1,86 @@
+# ==============================================================================
+#                 Deployable PDF Splitter Workflow
+# ==============================================================================
+# This workflow orchestrates the initial PDF splitting process. It is
+# triggered by a file upload to GCS and calls a worker Cloud Function to
+# perform the splitting and then triggers the main processing orchestrator.
+# ==============================================================================
+
 main:
-  params:
-    - args
+  params: [event] # Receives the CloudEvent from the GCS trigger
   steps:
-    - initialize:
+    - init:
         assign:
           - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
-          - execution_id: ${sys.get_env("GOOGLE_CLOUD_WORKFLOW_EXECUTION_ID")}
-          - firestore_doc_path: ${"projects/" + project_id + "/databases/(default)/documents/documents/" + args.documentId}
-          - config:
-              split_pages_bucket: ${sys.get_env("SPLIT_PAGES_BUCKET")}
-              urls:
-                translator: ${sys.get_env("TRANSLATOR_URL")}
-                aggregator: ${sys.get_env("AGGREGATOR_URL")}
-                cleaner: ${sys.get_env("CLEANER_URL")}
-                splitter: ${sys.get_env("SPLITTER_URL")}
+          - workflow_id: "document-processing-orchestrator"
+          - workflow_location: "us-central1"
+          # The URL of a function that contains the splitting logic from your Go code.
+          - splitter_worker_url: ${sys.get_env("PDF_SPLITTER_WORKER_URL")}
+          - gcs_bucket: ${event.data.bucket}
+          - gcs_object: ${event.data.name}
           - default_retry_policy:
               predicate: ${http.default_retry_predicate}
               max_retries: 5
               backoff:
                 initial_delay: 2
                 multiplier: 2
+        logging:
+          severity: 'INFO'
+          text: ${"Starting PDF splitter workflow for gs://" + gcs_bucket + "/" + gcs_object}
 
-    - main_execution_block:
+    - call_splitter_worker:
         try:
-          - read_firestore_document:
-              call: googleapis.firestore.v1.projects.databases.documents.get
-              args:
-                name: ${firestore_doc_path}
-              result: firestore_doc
-              retry: ${default_retry_policy}
-
-          - idempotency_check:
-              switch:
-                - condition: ${firestore_doc.fields.status.stringValue == "WORKFLOW_STARTED" or firestore_doc.fields.status.stringValue == "COMPLETE"}
-                  return: ${"Duplicate trigger for document " + args.documentId + ". Status is " + firestore_doc.fields.status.stringValue}
-
-          - claim_job:
-              call: googleapis.firestore.v1.projects.databases.documents.patch
-              args:
-                name: ${firestore_doc.name}
-                updateMask:
-                  # FORMATTING: Converted from inline list
-                  fieldPaths:
-                    - status
-                    - workflowExecutionId
-                body:
-                  fields:
-                    status:
-                      stringValue: WORKFLOW_STARTED
-                    workflowExecutionId:
-                      stringValue: ${execution_id}
-              retry: ${default_retry_policy}
-
-          - translate_pages_in_parallel:
-              parallel:
-                max_concurrency: 10
-                for:
-                  value: page_number
-                  in: ${range(1, args.pageCount + 1)}
-                  steps:
-                    - call_page_translator:
-                        call: call_authenticated_function
-                        args:
-                          url: ${config.urls.translator}
-                          body:
-                            documentId: ${args.documentId}
-                            pageNumber: ${page_number}
-                            gcsUri: ${"gs://" + config.split_pages_bucket + "/" + args.documentId + "/" + text.format("%04d", page_number) + ".pdf"}
-                            executionId: ${execution_id}
-                          retry_policy: ${default_retry_policy}
-
-          - aggregate_markdown:
-              call: call_authenticated_function
-              args:
-                url: ${config.urls.aggregator}
-                body:
-                  documentId: ${args.documentId}
-                  executionId: ${execution_id}
-                retry_policy: ${default_retry_policy}
-              result: aggregate_result
-
-          - clean_markdown:
-              call: call_authenticated_function
-              args:
-                url: ${config.urls.cleaner}
-                body:
-                  documentId: ${args.documentId}
-                  masterGcsUri: ${aggregate_result.body.masterGcsUri}
-                  executionId: ${execution_id}
-                retry_policy: ${default_retry_policy}
-              result: clean_result
-
-          - split_sections:
-              call: call_authenticated_function
-              args:
-                url: ${config.urls.splitter}
-                body:
-                  documentId: ${args.documentId}
-                  cleanedGcsUri: ${clean_result.body.cleanedGcsUri}
-                  executionId: ${execution_id}
-                retry_policy: ${default_retry_policy}
-          
-          - finalize_job:
-              call: googleapis.firestore.v1.projects.databases.documents.patch
-              args:
-                name: ${firestore_doc.name}
-                updateMask:
-                  fieldPaths:
-                    - status
-                body:
-                  fields:
-                    status:
-                      stringValue: COMPLETE
-              retry: ${default_retry_policy}
-          
-          - return_success:
-              return: "Workflow completed successfully."
-
+          call: http.post
+          args:
+            url: ${splitter_worker_url}
+            auth:
+              type: OIDC
+            body:
+              bucket: ${gcs_bucket}
+              name: ${gcs_object}
+            timeout: 540 # Timeout in seconds, matching the function timeout
+          result: splitter_result
         except:
           as: e
           steps:
-            - update_status_on_error:
-                call: update_status_on_error
-                args:
-                  firestoreDocName: ${firestore_doc_path}
-                  error: ${e}
-            - fail_workflow:
+            - log_splitter_failure:
+                logging:
+                  severity: 'ERROR'
+                  text: ${"Calling the PDF splitter worker function failed for " + gcs_object}
+            - fail_execution:
                 raise: ${e}
 
-# =====================================================================================
-# SUB-WORKFLOWS & HELPERS
-# =====================================================================================
+    - check_splitter_response:
+        switch:
+          - condition: ${splitter_result.body.status == "duplicate"}
+            steps:
+              - log_duplicate:
+                  logging:
+                    severity: 'INFO'
+                    text: ${"Skipping duplicate file:" + gcs_object}
+              - finish_duplicate:
+                  return: 'Duplicate file detected. Workflow halted as expected.'
+          - condition: ${splitter_result.body.status == "success"}
+            next: trigger_main_orchestrator
+        next: fail_on_bad_response
 
-call_authenticated_function:
-  params:
-    - url
-    - body
-    - retry_policy
-  steps:
-    - post_request:
-        call: http.post
+    - trigger_main_orchestrator:
+        call: googleapis.workflows.v1.projects.locations.workflows.executions.create
         args:
-          url: ${url}
-          auth:
-            type: OIDC
-          body: ${body}
-        result: response
-        retry: ${retry_policy}
-    - check_response_code:
-        switch:
-          - condition: ${response.code < 400}
-            return: ${response}
-    - raise_intelligent_error:
-        switch:
-          - condition: ${response.code >= 500}
-            raise:
-              type: "ServerError"
-              http_code: ${response.code}
-              message: "Downstream function returned a server error."
-              response_body: ${response.body}
-          - condition: ${response.code >= 400}
-            raise:
-              type: "ClientError"
-              http_code: ${response.code}
-              message: "Downstream function rejected the request as a client error."
-              response_body: ${response.body}
+          parent: ${"projects/" + project_id + "/locations/" + workflow_location + "/workflows/" + workflow_id}
+          execution:
+            argument: ${json.encode({"documentId:" splitter_result.body.documentId, "pageCount:" splitter_result.body.pageCount})}
+        result: execution_result
+        next: log_success
 
-update_status_on_error:
-  params:
-    - firestoreDocName
-    - error
-  steps:
-    - generate_error_details:
-        assign:
-          - http_error_type: ${map.get(error, "type", "Unknown")}
-          - error_string: ""
-        switch:
-          - condition: ${http_error_type == "ServerError" or http_error_type == "ClientError"}
-            assign:
-              - error_string: ${"Step " + error.step + ". Type " + error.type + " (HTTP " + string(error.http_code) + "). Message " + error.message}
-          - condition: true
-            assign:
-              - error_string: ${"Step " + map.get(error, "step", "N/A") + ". Details " + json.encode_to_string(error)}
-    - try_to_update_firestore:
-        try:
-          - patch_firestore_on_error:
-              call: googleapis.firestore.v1.projects.databases.documents.patch
-              args:
-                name: ${firestoreDocName}
-                updateMask:
-                  fieldPaths:
-                    - status
-                    - errorDetails
-                body:
-                  fields:
-                    status:
-                      stringValue: "FAILED_IN_WORKFLOW"
-                    errorDetails:
-                      stringValue: ${error_string}
-              retry: ${http.default_retry}
-        except:
-          as: updateError
-          steps:
-            - log_critical_failure:
-                call: sys.log
-                args:
-                  severity: CRITICAL
-                  text: ${"CRITICAL Could not update Firestore to FAILED status. Original Error " + json.encode_to_string(error) + ". Update Error " + json.encode_to_string(updateError)}
+    - log_success:
+        logging:
+          severity: 'INFO'
+          text: ${"Successfully triggered main orchestrator. Execution ID:" + execution_result.name}
+        next: end
+
+    - fail_on_bad_response:
+        raise: ${"Splitter worker returned an unexpected status:" + splitter_result.body.status}
+
+    - end:
+        return: 'PDF Splitting and main workflow trigger completed.'

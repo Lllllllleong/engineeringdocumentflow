@@ -35,14 +35,9 @@ export WORKFLOW_LOCATION="us-central1"
 export WORKFLOW_ID="document-processing-orchestrator"
 export FIRESTORE_COLLECTION="documents"
 
-# --- Cloud Function URLs (Required by the Workflow) ---
-# IMPORTANT: You must deploy the functions first, then copy their trigger URLs here.
-# You can get the URLs from the output of the 'gcloud functions deploy' command
-# or from the Google Cloud Console.
-export TRANSLATOR_URL="https://page-translator-..." # TODO: Fill this in after deploying page-translator
-export AGGREGATOR_URL="https://markdown-aggregator-..." # TODO: Fill this in after deploying markdown-aggregator
-export CLEANER_URL="https://markdown-cleaner-..." # TODO: Fill this in after deploying markdown-cleaner
-export SPLITTER_URL="https://section-splitter-..." # TODO: Fill this in after deploying section-splitter
-
+# --- Cloud Function URLs (REMOVED) ---
+# These are now set dynamically by the ./scripts/deploy.sh script after
+# each function is deployed. There is no need to define them here.
 
 echo "✅ Environment variables set for the Document Processing Pipeline."
+

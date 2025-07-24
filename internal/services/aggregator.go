@@ -4,7 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
+	"sort"
 	"strings"
 
 	"cloud.google.com/go/storage"
@@ -55,7 +56,8 @@ func NewAggregator(ctx context.Context) (*AggregatorFunction, error) {
 
 // Process handles the core logic of aggregating Markdown files.
 func (f *AggregatorFunction) Process(ctx context.Context, req *models.MarkdownAggregatorRequest) (*models.MarkdownAggregatorResponse, error) {
-	log.Printf("[Doc: %s][Exec: %s] Starting aggregation.", req.DocumentID, req.ExecutionID)
+	logCtx := slog.With("documentId", req.DocumentID, "executionId", req.ExecutionID)
+	logCtx.Info("Starting aggregation.")
 
 	// --- 1. List all .md files for the documentId ---
 	query := &storage.Query{Prefix: req.DocumentID + "/"}
@@ -68,7 +70,7 @@ func (f *AggregatorFunction) Process(ctx context.Context, req *models.MarkdownAg
 			break
 		}
 		if err != nil {
-			log.Printf("[Doc: %s][Exec: %s] ERROR listing objects: %v", req.DocumentID, req.ExecutionID, err)
+			logCtx.Error("Failed to list objects in source bucket", "error", err, "bucket", f.config.TranslatedMarkdownBucket)
 			return nil, fmt.Errorf("failed to list markdown files: %w", err)
 		}
 		if strings.HasSuffix(attrs.Name, ".md") {
@@ -76,13 +78,14 @@ func (f *AggregatorFunction) Process(ctx context.Context, req *models.MarkdownAg
 		}
 	}
 
-	// Fail-fast if no source files are found (per our design decision).
 	if len(objectNames) == 0 {
-		log.Printf("[Doc: %s][Exec: %s] WARNING: No markdown files found to aggregate.", req.DocumentID, req.ExecutionID)
-		return nil, fmt.Errorf("no markdown files found for document ID %s", req.DocumentID)
+		logCtx.Warn("No markdown files found to aggregate. This might be an error or an empty document.")
+		// We proceed to create an empty master file for consistency downstream.
 	}
 
-	
+	// --- 2. Sort the filenames to ensure correct page order ---
+	sort.Strings(objectNames)
+	logCtx.Info("Found and sorted files for aggregation.", "fileCount", len(objectNames))
 
 	// --- 3. Stream-concatenate files with centralized error handling ---
 	outputObjectName := fmt.Sprintf("%s/master.md", req.DocumentID)
@@ -90,7 +93,7 @@ func (f *AggregatorFunction) Process(ctx context.Context, req *models.MarkdownAg
 	var aggregationErr error
 
 	for _, objName := range objectNames {
-		log.Printf("[Doc: %s][Exec: %s] Appending page: %s", req.DocumentID, req.ExecutionID, objName)
+		logCtx.Info("Appending page.", "gcsObject", objName)
 		sourceReader, err := f.storageClient.Bucket(f.config.TranslatedMarkdownBucket).Object(objName).NewReader(ctx)
 		if err != nil {
 			aggregationErr = fmt.Errorf("failed to read %s: %w", objName, err)
@@ -104,26 +107,24 @@ func (f *AggregatorFunction) Process(ctx context.Context, req *models.MarkdownAg
 		}
 		sourceReader.Close() // Close successful reader
 
+		// Add a separator between files.
 		if _, err := destWriter.Write([]byte("\n\n---\n\n")); err != nil {
 			aggregationErr = fmt.Errorf("failed to write separator: %w", err)
 			break // Exit the loop on error
 		}
 	}
 
-	// Centralized cleanup and finalization.
-	// An error closing the writer is critical as it means the upload failed. This takes precedence.
 	if err := destWriter.Close(); err != nil {
-		log.Printf("[Doc: %s][Exec: %s] CRITICAL: Failed to finalize master.md write: %v", req.DocumentID, req.ExecutionID, err)
+		logCtx.Error("Critical: Failed to finalize master.md write", "error", err, "object", outputObjectName)
 		return nil, fmt.Errorf("failed to finalize master.md: %w", err)
 	}
 
-	// If we broke out of the loop with an error, return it now that we've cleaned up the writer.
 	if aggregationErr != nil {
-		log.Printf("[Doc: %s][Exec: %s] ERROR during aggregation loop: %v", req.DocumentID, req.ExecutionID, aggregationErr)
+		logCtx.Error("Error during aggregation loop", "error", aggregationErr)
 		return nil, aggregationErr
 	}
 
-	log.Printf("[Doc: %s][Exec: %s] Aggregation complete.", req.DocumentID, req.ExecutionID)
+	logCtx.Info("Aggregation complete.")
 
 	// --- 4. Return the URI of the new master file ---
 	outputGCSUri := fmt.Sprintf("gs://%s/%s", f.config.AggregatedMarkdownBucket, outputObjectName)
@@ -132,4 +133,3 @@ func (f *AggregatorFunction) Process(ctx context.Context, req *models.MarkdownAg
 		MasterGCSUri: outputGCSUri,
 	}, nil
 }
-

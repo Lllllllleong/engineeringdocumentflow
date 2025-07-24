@@ -3,8 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"log"
+	"log/slog"
 	"net/http"
+	"os"
 	"sync"
 
 	"github.com/GoogleCloudPlatform/functions-framework-go/functions"
@@ -19,6 +20,10 @@ var (
 )
 
 func init() {
+	// --- Set up structured logging ---
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	slog.SetDefault(logger)
+
 	// Register the HTTP function with the framework.
 	// "HandleSplitSections" is the entry point name configured in GCP.
 	functions.HTTP("HandleSplitSections", handleSplitSections)
@@ -35,7 +40,7 @@ func handleSplitSections(w http.ResponseWriter, r *http.Request) {
 		splitterInstance, initErr = services.NewSectionSplitter(context.Background())
 	})
 	if initErr != nil {
-		log.Printf("CRITICAL: SectionSplitter initialization failed: %v", initErr)
+		slog.Error("Critical: SectionSplitter initialization failed", "error", initErr)
 		http.Error(w, "Internal Server Error: failed to initialize service", http.StatusInternalServerError)
 		return
 	}
@@ -43,7 +48,7 @@ func handleSplitSections(w http.ResponseWriter, r *http.Request) {
 	// Decode the incoming JSON request from the workflow.
 	var req models.SectionSplitterRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		log.Printf("ERROR: Could not decode request body: %v", err)
+		slog.Warn("Could not decode request body", "error", err)
 		http.Error(w, "Bad Request: could not parse JSON", http.StatusBadRequest)
 		return
 	}
@@ -59,7 +64,12 @@ func handleSplitSections(w http.ResponseWriter, r *http.Request) {
 	// If successful, encode the response and send it back to the workflow.
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(res); err != nil {
-		log.Printf("ERROR: Failed to write response: %v", err)
+		slog.Error(
+			"Failed to write response",
+			"error", err,
+			"documentId", req.DocumentID,
+			"executionId", req.ExecutionID,
+		)
 		http.Error(w, "Internal Server Error: failed to encode response", http.StatusInternalServerError)
 	}
 }

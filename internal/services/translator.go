@@ -3,14 +3,13 @@ package services
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 
 	"cloud.google.com/go/storage"
 	"cloud.google.com/go/vertexai/genai"
 	"github.com/Lllllllleong/engineeringdocumentflow/internal/gcp"
 	"github.com/Lllllllleong/engineeringdocumentflow/internal/models"
-	// "google.golang.org/api/googleapi" // No longer needed directly in this file
 )
 
 // TranslatorConfig holds all configuration for the translator service.
@@ -71,7 +70,12 @@ func NewTranslator(ctx context.Context) (*TranslatorFunction, error) {
 
 // Process handles the core logic of translating a single PDF page to Markdown.
 func (f *TranslatorFunction) Process(ctx context.Context, req *models.PageTranslatorRequest) (*models.PageTranslatorResponse, error) {
-	log.Printf("[Doc: %s][Page: %d][Exec: %s] Starting translation.", req.DocumentID, req.PageNumber, req.ExecutionID)
+	logCtx := slog.With(
+		"documentId", req.DocumentID,
+		"pageNumber", req.PageNumber,
+		"executionId", req.ExecutionID,
+	)
+	logCtx.Info("Starting translation.")
 
 	model := f.vertexClient.TranslatorModel
 	prompt := genai.Text(gcp.TranslatorUserPrompt)
@@ -82,13 +86,13 @@ func (f *TranslatorFunction) Process(ctx context.Context, req *models.PageTransl
 
 	geminiResp, err := model.GenerateContent(ctx, filePart, prompt)
 	if err != nil {
-		log.Printf("[Doc: %s][Page: %d][Exec: %s] ERROR calling Vertex AI: %v", req.DocumentID, req.PageNumber, req.ExecutionID, err)
+		logCtx.Error("Call to Vertex AI failed", "error", err)
 		return nil, fmt.Errorf("failed to generate content from gemini: %w", err)
 	}
 
 	markdownContent := f.extractMarkdown(geminiResp, req)
 
-	// Sanity check for LLM refusal. If the model refuses to answer, we must fail fast.
+	// Sanity check for LLM refusal.
 	refusalPhrases := []string{
 		"i am unable to",
 		"i cannot fulfill",
@@ -100,13 +104,13 @@ func (f *TranslatorFunction) Process(ctx context.Context, req *models.PageTransl
 	for _, phrase := range refusalPhrases {
 		if strings.Contains(lowerMarkdownContent, phrase) {
 			err := fmt.Errorf("gemini response indicates refusal for page %d", req.PageNumber)
-			log.Printf("[Doc: %s][Page: %d][Exec: %s] ERROR: %v. Response: '%s'", req.DocumentID, req.PageNumber, req.ExecutionID, err, markdownContent)
+			logCtx.Error("LLM refusal detected", "error", err, "response", markdownContent)
 			return nil, err // This will fail the step in the workflow.
 		}
 	}
 
 	if markdownContent == "" {
-		log.Printf("[Doc: %s][Page: %d][Exec: %s] WARNING: No markdown content extracted from response. Treating as empty page.", req.DocumentID, req.PageNumber, req.ExecutionID)
+		logCtx.Warn("No markdown content extracted from response. Treating as empty page.")
 	}
 
 	// --- Use the shared, atomic GCS save function ---
@@ -115,12 +119,12 @@ func (f *TranslatorFunction) Process(ctx context.Context, req *models.PageTransl
 
 	if err := gcp.SaveToGCSAtomically(ctx, bucketHandle, objectName, markdownContent); err != nil {
 		// The shared function logs the generic error, but we add our own with more context.
-		log.Printf("[Doc: %s][Page: %d][Exec: %s] ERROR: Failed to save to GCS atomically: %v", req.DocumentID, req.PageNumber, req.ExecutionID, err)
+		logCtx.Error("Failed to save to GCS atomically", "error", err, "bucket", f.config.MarkdownBucket, "object", objectName)
 		return nil, err
 	}
 
 	outputGCSUri := fmt.Sprintf("gs://%s/%s", f.config.MarkdownBucket, objectName)
-	log.Printf("[Doc: %s][Page: %d][Exec: %s] Translation complete. Saved to %s", req.DocumentID, req.PageNumber, req.ExecutionID, outputGCSUri)
+	logCtx.Info("Translation complete.", "outputGcsUri", outputGCSUri)
 	return &models.PageTranslatorResponse{
 		Status:       "success",
 		OutputGCSUri: outputGCSUri,
@@ -143,7 +147,13 @@ func (f *TranslatorFunction) extractMarkdown(resp *genai.GenerateContentResponse
 	}
 
 	if textPartsFound > 1 {
-		log.Printf("[Doc: %s][Page: %d][Exec: %s] WARNING: Gemini response contained %d text parts; they have been concatenated.", req.DocumentID, req.PageNumber, req.ExecutionID, textPartsFound)
+		slog.Warn(
+			"Gemini response contained multiple text parts; they have been concatenated.",
+			"documentId", req.DocumentID,
+			"pageNumber", req.PageNumber,
+			"executionId", req.ExecutionID,
+			"partCount", textPartsFound,
+		)
 	}
 
 	contentStr := strings.TrimSpace(markdownContent.String())

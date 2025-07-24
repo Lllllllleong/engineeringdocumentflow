@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"regexp"
 	"strings"
 
@@ -16,8 +16,8 @@ import (
 
 // SectionSplitterConfig holds configuration for the section_splitter service.
 type SectionSplitterConfig struct {
-	ProjectID         string
-	VertexAIRegion    string
+	ProjectID           string
+	VertexAIRegion      string
 	FinalSectionsBucket string
 }
 
@@ -42,8 +42,8 @@ func NewSectionSplitter(ctx context.Context) (*SectionSplitterFunction, error) {
 	}
 
 	config := SectionSplitterConfig{
-		ProjectID:         projectID,
-		VertexAIRegion:    gcp.GetEnv("VERTEX_AI_REGION", "us-central1"),
+		ProjectID:           projectID,
+		VertexAIRegion:      gcp.GetEnv("VERTEX_AI_REGION", "us-central1"),
 		FinalSectionsBucket: gcp.GetEnv("FINAL_SECTIONS_BUCKET", ""),
 	}
 	if config.FinalSectionsBucket == "" {
@@ -69,7 +69,8 @@ func NewSectionSplitter(ctx context.Context) (*SectionSplitterFunction, error) {
 
 // Process handles the core logic of splitting a markdown file into sections.
 func (f *SectionSplitterFunction) Process(ctx context.Context, req *models.SectionSplitterRequest) (*models.SectionSplitterResponse, error) {
-	log.Printf("[Doc: %s][Exec: %s] Starting section splitting from URI: %s", req.DocumentID, req.ExecutionID, req.CleanedGCSUri)
+	logCtx := slog.With("documentId", req.DocumentID, "executionId", req.ExecutionID)
+	logCtx.Info("Starting section splitting.", "gcsUri", req.CleanedGCSUri)
 
 	// --- 1. Call the pre-configured section splitter model ---
 	model := f.vertexClient.SectionSplitterModel
@@ -81,51 +82,51 @@ func (f *SectionSplitterFunction) Process(ctx context.Context, req *models.Secti
 
 	resp, err := model.GenerateContent(ctx, filePart, prompt)
 	if err != nil {
-		log.Printf("[Doc: %s][Exec: %s] ERROR calling Vertex AI for section splitting: %v", req.DocumentID, req.ExecutionID, err)
+		logCtx.Error("Call to Vertex AI for section splitting failed", "error", err)
 		return nil, fmt.Errorf("failed to generate sections from gemini: %w", err)
 	}
 
 	// --- 2. Extract and parse the JSON response ---
 	jsonString := f.extractJSONContent(resp)
 	if jsonString == "" {
-		log.Printf("[Doc: %s][Exec: %s] ERROR: Gemini returned an empty response instead of JSON.", req.DocumentID, req.ExecutionID)
-		return nil, fmt.Errorf("gemini returned empty response for document ID %s", req.DocumentID)
+		err := fmt.Errorf("gemini returned an empty response instead of JSON for document ID %s", req.DocumentID)
+		logCtx.Error("Empty response from Gemini", "error", err)
+		return nil, err
 	}
 
 	var sections []parsedSection
 	if err := json.Unmarshal([]byte(jsonString), &sections); err != nil {
-		log.Printf("[Doc: %s][Exec: %s] ERROR: Failed to unmarshal JSON response from Gemini: %v. Response was: %s", req.DocumentID, req.ExecutionID, err, jsonString)
+		logCtx.Error("Failed to unmarshal JSON response from Gemini", "error", err, "responseBody", jsonString)
 		return nil, fmt.Errorf("failed to parse JSON from model for document ID %s: %w", req.DocumentID, err)
 	}
 
 	if len(sections) == 0 {
-		log.Printf("[Doc: %s][Exec: %s] WARNING: Model returned a valid but empty JSON array. No sections to process.", req.DocumentID, req.ExecutionID)
+		logCtx.Warn("Model returned a valid but empty JSON array. No sections to process.")
 		return &models.SectionSplitterResponse{Status: "success", SectionCount: 0}, nil
 	}
 
 	// --- 3. Save each section to a separate file in GCS ---
-	log.Printf("[Doc: %s][Exec: %s] Successfully parsed %d sections. Saving to GCS...", req.DocumentID, req.ExecutionID, len(sections))
+	logCtx.Info("Successfully parsed sections. Saving to GCS...", "sectionCount", len(sections))
 	bucketHandle := f.storageClient.Bucket(f.config.FinalSectionsBucket)
 	var savedCount int
 
 	for i, section := range sections {
-		// Sanitize the section title to create a safe and unique filename.
 		sanitizedTitle := f.sanitizeFileName(section.Section)
 		if sanitizedTitle == "" {
 			sanitizedTitle = fmt.Sprintf("untitled_section_%d", i+1)
 		}
-		
+
 		objectName := fmt.Sprintf("%s/%s.md", req.DocumentID, sanitizedTitle)
 
 		if err := gcp.SaveToGCSAtomically(ctx, bucketHandle, objectName, section.Content); err != nil {
-			log.Printf("[Doc: %s][Exec: %s] ERROR: Failed to save section '%s' to %s: %v. Continuing...", req.DocumentID, req.ExecutionID, section.Section, objectName, err)
+			logCtx.Error("Failed to save section", "error", err, "sectionTitle", section.Section, "objectName", objectName)
 			// We choose to continue processing other sections even if one fails.
 		} else {
 			savedCount++
 		}
 	}
 
-	log.Printf("[Doc: %s][Exec: %s] Section splitting complete. Saved %d out of %d sections.", req.DocumentID, req.ExecutionID, savedCount, len(sections))
+	logCtx.Info("Section splitting complete.", "savedCount", savedCount, "totalSections", len(sections))
 
 	return &models.SectionSplitterResponse{
 		Status:       "success",
@@ -138,8 +139,13 @@ func (f *SectionSplitterFunction) extractJSONContent(resp *genai.GenerateContent
 	if resp == nil || len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil || len(resp.Candidates[0].Content.Parts) == 0 {
 		return ""
 	}
+	// The model is configured to return JSON, so we expect a single text part.
 	if txt, ok := resp.Candidates[0].Content.Parts[0].(genai.Text); ok {
-		return string(txt)
+		// Clean potential markdown fences just in case
+		cleanJSON := strings.TrimSpace(string(txt))
+		cleanJSON = strings.TrimPrefix(cleanJSON, "```json")
+		cleanJSON = strings.TrimSuffix(cleanJSON, "```")
+		return strings.TrimSpace(cleanJSON)
 	}
 	return ""
 }
@@ -157,8 +163,11 @@ func (f *SectionSplitterFunction) sanitizeFileName(title string) string {
 	sanitized = strings.Trim(sanitized, "_")
 
 	// Truncate to a reasonable length to avoid overly long filenames
-	if len(sanitized) > 100 {
-		sanitized = sanitized[:100]
+	const maxLength = 100
+	if len(sanitized) > maxLength {
+		sanitized = sanitized[:maxLength]
+		// Trim again in case we cut on an underscore
+		sanitized = strings.Trim(sanitized, "_")
 	}
 
 	return sanitized

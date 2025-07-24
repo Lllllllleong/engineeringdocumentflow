@@ -4,7 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
+	"os"
 	"sync"
 
 	"github.com/GoogleCloudPlatform/functions-framework-go/functions"
@@ -14,11 +15,15 @@ import (
 
 var (
 	pdfSplitterInstance *services.PDFSplitterFunction
-	once             sync.Once
-	initErr          error
+	once                sync.Once
+	initErr             error
 )
 
 func init() {
+	// --- Set up structured logging ---
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	slog.SetDefault(logger)
+
 	// Register the CloudEvent function. The framework will handle routing the event here.
 	functions.CloudEvent("SplitAndPublish", splitAndPublish)
 }
@@ -34,23 +39,22 @@ func splitAndPublish(ctx context.Context, e cloudevents.Event) error {
 		pdfSplitterInstance, initErr = services.NewPDFSplitter(context.Background())
 	})
 	if initErr != nil {
-		log.Fatalf("Critical error during function initialization: %v", initErr)
+		// If initialization fails, log the fatal error and the function will terminate.
+		slog.Error("Critical error during function initialization", "error", initErr)
 		return initErr
 	}
 
-	// This is the crucial new step: unmarshal the event's data payload
-	// into the specific struct our business logic expects.
+	// Unmarshal the event's data payload into our specific struct.
 	var gcsEvent services.GCSEvent
 	if err := json.Unmarshal(e.Data(), &gcsEvent); err != nil {
-		log.Printf("ERROR: failed to unmarshal event data: %v", err)
+		slog.Error("Failed to unmarshal event data", "error", err, "data", string(e.Data()))
 		return fmt.Errorf("json.Unmarshal: %w", err)
 	}
 
-	// Now, delegate the actual processing to our clean business logic method,
-	// passing the correctly typed and populated struct.
+	// Delegate the actual processing to our business logic method.
 	err := pdfSplitterInstance.Process(ctx, gcsEvent)
 	if err != nil {
-		// The error is already logged within the Process method.
+		// The error is already logged with context within the Process method.
 		// Returning it marks the function invocation as failed.
 		return err
 	}

@@ -3,8 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"log"
+	"log/slog"
 	"net/http"
+	"os"
 	"sync"
 
 	"github.com/GoogleCloudPlatform/functions-framework-go/functions"
@@ -19,6 +20,10 @@ var (
 )
 
 func init() {
+	// --- Set up structured logging ---
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	slog.SetDefault(logger)
+
 	functions.HTTP("HandleAggregateMarkdown", handleAggregateMarkdown)
 }
 
@@ -30,27 +35,33 @@ func handleAggregateMarkdown(w http.ResponseWriter, r *http.Request) {
 		aggregatorInstance, initErr = services.NewAggregator(context.Background())
 	})
 	if initErr != nil {
-		log.Printf("CRITICAL: Aggregator initialization failed: %v", initErr)
+		slog.Error("Critical: Aggregator initialization failed", "error", initErr)
 		http.Error(w, "Internal Server Error: failed to initialize service", http.StatusInternalServerError)
 		return
 	}
 
 	var req models.MarkdownAggregatorRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		log.Printf("ERROR: Could not decode request body: %v", err)
+		slog.Warn("Could not decode request body", "error", err)
 		http.Error(w, "Bad Request: could not parse JSON", http.StatusBadRequest)
 		return
 	}
 
 	res, err := aggregatorInstance.Process(r.Context(), &req)
 	if err != nil {
+		// Error is already logged with context in the Process method.
 		http.Error(w, "Internal Server Error: processing failed", http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(res); err != nil {
-		log.Printf("ERROR: Failed to write response: %v", err)
+		slog.Error(
+			"Failed to write response",
+			"error", err,
+			"documentId", req.DocumentID,
+			"executionId", req.ExecutionID,
+		)
 		http.Error(w, "Internal Server Error: failed to encode response", http.StatusInternalServerError)
 	}
 }

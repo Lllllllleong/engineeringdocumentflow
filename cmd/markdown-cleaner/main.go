@@ -3,8 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"log"
+	"log/slog"
 	"net/http"
+	"os"
 	"sync"
 
 	"github.com/GoogleCloudPlatform/functions-framework-go/functions"
@@ -19,6 +20,12 @@ var (
 )
 
 func init() {
+	// --- Set up structured logging ---
+	// This creates a JSON logger that writes to the standard output,
+	// which is automatically collected by Google Cloud Logging.
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	slog.SetDefault(logger)
+
 	// Register the HTTP function with the framework.
 	// "HandleCleanMarkdown" is the entry point name configured in GCP.
 	functions.HTTP("HandleCleanMarkdown", handleCleanMarkdown)
@@ -34,7 +41,7 @@ func handleCleanMarkdown(w http.ResponseWriter, r *http.Request) {
 		cleanerInstance, initErr = services.NewCleaner(context.Background())
 	})
 	if initErr != nil {
-		log.Printf("CRITICAL: Cleaner initialization failed: %v", initErr)
+		slog.Error("Critical: Cleaner initialization failed", "error", initErr)
 		http.Error(w, "Internal Server Error: failed to initialize service", http.StatusInternalServerError)
 		return
 	}
@@ -42,7 +49,7 @@ func handleCleanMarkdown(w http.ResponseWriter, r *http.Request) {
 	// Decode the incoming JSON request from the workflow.
 	var req models.MarkdownCleanerRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		log.Printf("ERROR: Could not decode request body: %v", err)
+		slog.Warn("Could not decode request body", "error", err)
 		http.Error(w, "Bad Request: could not parse JSON", http.StatusBadRequest)
 		return
 	}
@@ -50,7 +57,7 @@ func handleCleanMarkdown(w http.ResponseWriter, r *http.Request) {
 	// Delegate to the business logic.
 	res, err := cleanerInstance.Process(r.Context(), &req)
 	if err != nil {
-		// The specific error is already logged inside the Process method.
+		// The specific error is already logged inside the Process method with context.
 		http.Error(w, "Internal Server Error: processing failed", http.StatusInternalServerError)
 		return
 	}
@@ -58,7 +65,12 @@ func handleCleanMarkdown(w http.ResponseWriter, r *http.Request) {
 	// If successful, encode the response and send it back to the workflow.
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(res); err != nil {
-		log.Printf("ERROR: Failed to write response: %v", err)
+		slog.Error(
+			"Failed to write response",
+			"error", err,
+			"documentId", req.DocumentID,
+			"executionId", req.ExecutionID,
+		)
 		http.Error(w, "Internal Server Error: failed to encode response", http.StatusInternalServerError)
 	}
 }
