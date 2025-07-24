@@ -1,0 +1,198 @@
+---
+main:
+  params:
+    - args
+  steps:
+    - init:
+        assign:
+          - project_id: ${sys.get_env("GCP_PROJECT")}
+          - execution_id: ${sys.get_env("GOOGLE_CLOUD_WORKFLOW_EXECUTION_ID")}
+          - config:
+              collection_name: documents
+              split_pages_bucket: ${sys.get_env("SPLIT_PAGES_BUCKET")}
+              urls:
+                translator: https_page_translator_url
+                aggregator: https_markdown_aggregator_url
+                cleaner: https_markdown_cleaner_url
+                splitter: https_section_splitter_url
+    - getDocumentFromFirestore:
+        try:
+          - callApi:
+              call: googleapis.firestore.v1.projects.databases.documents.get
+              args:
+                name: ${"projects/" + project_id + "/databases/(default)/documents/" +
+                  config.collection_name + "/" + args.documentId}
+              result: firestoreDoc
+        except:
+          as: e
+          steps: null
+    - logAndRaise:
+        raise: >
+          ${"Firestore document not found: " + args.documentId + ". Error: " +
+          e.message}
+    - validateDocumentState:
+        switch:
+          - condition: ${...}
+            return: >
+              ${"Duplicate trigger for document " + args.documentId + ". Status: " +
+              firestoreDoc.fields.status.stringValue}
+    - condition: >
+        ${map.get(firestoreDoc.fields, "status",
+        {"stringValue":""}).stringValue == "WORKFLOW_STARTED" ||
+        map.get(firestoreDoc.fields, "status", {"stringValue":""}).stringValue
+        == "COMPLETE"}
+      return: >
+        ${"Duplicate trigger for document " + args.documentId + ". Status: " +
+        firestoreDoc.fields.status.stringValue}
+    - executeProcessingPipeline:
+        try:
+          - callProcessDocumentSubworkflow:
+              call: processDocument
+              args:
+                firestoreDoc: ${firestoreDoc}
+                args: ${args}
+                config: ${config}
+                execution_id: ${execution_id}
+              result: processingResult
+          - finish:
+              return: ${processingResult}
+        except:
+          as: e
+          steps:
+            - callUpdateStatusOnErrorSubworkflow:
+                call: updateStatusOnError
+                args:
+                  firestoreDocName: ${firestoreDoc.name}
+                  error: ${e}
+            - finish_failed:
+                return: Workflow failed and status has been updated in Firestore.
+processDocument:
+  params:
+    - firestoreDoc
+    - args
+    - config
+    - execution_id
+  steps:
+    - claimJob:
+        call: googleapis.firestore.v1.projects.databases.documents.patch
+        args:
+          name: ${firestoreDoc.name}
+          updateMask:
+            fieldPaths:
+              - status
+              - workflowExecutionId
+          body:
+            fields:
+              status:
+                stringValue: WORKFLOW_STARTED
+              workflowExecutionId:
+                stringValue: ${execution_id}
+        retry: ${http.default_retry}
+    - translatePages:
+        parallel:
+          for:
+            value: i
+            in: ${range(1, args.pageCount + 1)}
+            steps:
+              - translatePage:
+                  call: callAuthenticatedFunction
+                  args:
+                    url: ${config.urls.translator}
+                    body:
+                      documentId: ${args.documentId}
+                      pageNumber: ${i}
+                      gcsUri: ${"gs://" + config.split_pages_bucket + "/" + args.documentId + "/" + i
+                        + ".pdf"}
+                      executionId: ${execution_id}
+    - aggregateMarkdown:
+        call: callAuthenticatedFunction
+        args:
+          url: ${config.urls.aggregator}
+          body:
+            documentId: ${args.documentId}
+            executionId: ${execution_id}
+        result: aggregationResult
+    - cleanMarkdown:
+        call: callAuthenticatedFunction
+        args:
+          url: ${config.urls.cleaner}
+          body:
+            documentId: ${args.documentId}
+            masterGcsUri: ${aggregationResult.body.masterGcsUri}
+            executionId: ${execution_id}
+        result: cleanerResult
+    - splitSections:
+        call: callAuthenticatedFunction
+        args:
+          url: ${config.urls.splitter}
+          body:
+            documentId: ${args.documentId}
+            cleanedGcsUri: ${cleanerResult.body.cleanedGcsUri}
+            executionId: ${execution_id}
+    - finalizeJob:
+        call: googleapis.firestore.v1.projects.databases.documents.patch
+        args:
+          name: ${firestoreDoc.name}
+          updateMask:
+            fieldPaths:
+              - status
+          body:
+            fields:
+              status:
+                stringValue: COMPLETE
+        retry: ${http.default_retry}
+    - returnSuccess:
+        return: ${"Workflow completed successfully for document " + args.documentId}
+callAuthenticatedFunction:
+  params:
+    - url
+    - body
+  steps:
+    - postRequest:
+        call: http.post
+        args:
+          url: ${url}
+          auth:
+            type: OIDC
+          body: ${body}
+        result: response
+    - returnResponse:
+        return: ${response}
+updateStatusOnError:
+  params:
+    - firestoreDocName
+    - error
+  steps:
+    - logError:
+        call: sys.log
+        args:
+          text: |
+            ${"Workflow failed. Error: " + json.encode_to_string(error)}
+          severity: ERROR
+    - tryToUpdateFirestore:
+        try:
+          - patchFirestore:
+              call: googleapis.firestore.v1.projects.databases.documents.patch
+              args:
+                name: ${firestoreDocName}
+                updateMask:
+                  fieldPaths:
+                    - status
+                    - errorDetails
+                body:
+                  fields:
+                    status:
+                      stringValue: FAILED_IN_WORKFLOW
+                    errorDetails:
+                      stringValue: >
+                        ${json.encode_to_string(error.message) + " at step " + error.step}
+        except:
+          as: updateError
+          steps:
+            - logUpdateFailure:
+                call: sys.log
+                args:
+                  text: >
+                    ${"CRITICAL: Failed to update error status in Firestore. Update Error: " +
+                    json.encode_to_string(updateError)}
+                  severity: CRITICAL

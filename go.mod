@@ -7,7 +7,9 @@ require (
 	cloud.google.com/go/storage v1.55.0
 	cloud.google.com/go/workflows v1.14.2
 	github.com/GoogleCloudPlatform/functions-framework-go v1.9.2
+	github.com/cloudevents/sdk-go/v2 v2.15.2
 	github.com/pdfcpu/pdfcpu v0.11.0
+	golang.org/x/sync v0.14.0
 )
 
 require (
@@ -23,7 +25,6 @@ require (
 	github.com/GoogleCloudPlatform/opentelemetry-operations-go/exporter/metric v0.51.0 // indirect
 	github.com/GoogleCloudPlatform/opentelemetry-operations-go/internal/resourcemapping v0.51.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/cloudevents/sdk-go/v2 v2.15.2 // indirect
 	github.com/cncf/xds/go v0.0.0-20250121191232-2f005788dc42 // indirect
 	github.com/envoyproxy/go-control-plane/envoy v1.32.4 // indirect
 	github.com/envoyproxy/protoc-gen-validate v1.2.1 // indirect
@@ -63,7 +64,6 @@ require (
 	golang.org/x/image v0.27.0 // indirect
 	golang.org/x/net v0.40.0 // indirect
 	golang.org/x/oauth2 v0.30.0 // indirect
-	golang.org/x/sync v0.14.0 // indirect
 	golang.org/x/sys v0.33.0 // indirect
 	golang.org/x/text v0.25.0 // indirect
 	golang.org/x/time v0.11.0 // indirect
