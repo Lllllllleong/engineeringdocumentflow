@@ -11,6 +11,7 @@ import (
 	"github.com/GoogleCloudPlatform/functions-framework-go/functions"
 	"github.com/Lllllllleong/engineeringdocumentflow/internal/models"
 	"github.com/Lllllllleong/engineeringdocumentflow/internal/services"
+		_ "github.com/GoogleCloudPlatform/functions-framework-go/functions"
 )
 
 var (

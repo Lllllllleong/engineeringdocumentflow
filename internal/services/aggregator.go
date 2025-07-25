@@ -12,6 +12,7 @@ import (
 	"github.com/Lllllllleong/engineeringdocumentflow/internal/gcp"
 	"github.com/Lllllllleong/engineeringdocumentflow/internal/models"
 	"google.golang.org/api/iterator"
+		_ "github.com/GoogleCloudPlatform/functions-framework-go/functions"
 )
 
 // AggregatorConfig holds configuration for the aggregator service.

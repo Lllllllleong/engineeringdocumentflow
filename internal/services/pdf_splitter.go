@@ -22,6 +22,7 @@ import (
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 	"golang.org/x/sync/errgroup"
+		_ "github.com/GoogleCloudPlatform/functions-framework-go/functions"
 )
 
 type PDFSplitterConfig struct {

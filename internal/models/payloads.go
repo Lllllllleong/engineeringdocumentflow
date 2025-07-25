@@ -1,5 +1,6 @@
 package models
 
+import 	_ "github.com/GoogleCloudPlatform/functions-framework-go/functions"
 // These structs define the JSON payloads for HTTP requests and responses
 // between the Cloud Workflow and the worker Cloud Functions.
 

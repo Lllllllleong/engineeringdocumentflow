@@ -10,6 +10,7 @@ import (
 
 	"cloud.google.com/go/storage"
 	"google.golang.org/api/googleapi"
+		_ "github.com/GoogleCloudPlatform/functions-framework-go/functions"
 )
 
 // GetEnv is a helper to read an environment variable or return a default value.

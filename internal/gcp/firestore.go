@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"cloud.google.com/go/firestore"
+		_ "github.com/GoogleCloudPlatform/functions-framework-go/functions"
 )
 
 // NewFirestoreClient creates and returns a new Firestore client for the given project ID.

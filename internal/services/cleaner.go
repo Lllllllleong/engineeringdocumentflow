@@ -10,6 +10,7 @@ import (
 	"cloud.google.com/go/vertexai/genai"
 	"github.com/Lllllllleong/engineeringdocumentflow/internal/gcp"
 	"github.com/Lllllllleong/engineeringdocumentflow/internal/models"
+		_ "github.com/GoogleCloudPlatform/functions-framework-go/functions"
 )
 
 // CleanerConfig holds configuration for the markdown-cleaner service.

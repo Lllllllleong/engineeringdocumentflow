@@ -1,6 +1,9 @@
 package models
 
-import "time"
+import (
+	"time"
+	_ "github.com/GoogleCloudPlatform/functions-framework-go/functions"
+)
 
 // Document represents the main record for a PDF processing job in Firestore.
 // It tracks the overall status and metadata of the file.

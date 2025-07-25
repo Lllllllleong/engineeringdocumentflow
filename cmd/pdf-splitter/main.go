@@ -11,6 +11,7 @@ import (
 	"github.com/GoogleCloudPlatform/functions-framework-go/functions"
 	cloudevents "github.com/cloudevents/sdk-go/v2" // The official CloudEvents SDK
 	"github.com/Lllllllleong/engineeringdocumentflow/internal/services"
+	_ "github.com/GoogleCloudPlatform/functions-framework-go/functions"
 )
 
 var (

@@ -4,6 +4,7 @@ import (
 	"cloud.google.com/go/vertexai/genai"
 	"context"
 	"fmt"
+		_ "github.com/GoogleCloudPlatform/functions-framework-go/functions"
 )
 
 // --- Translator Model Prompts ---
